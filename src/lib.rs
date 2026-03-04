@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::io::ErrorKind;
 use std::process::Command;
-use std::time::{self, Duration};
+use std::time::{self, Duration, Instant};
 use subprocess::{Exec, Redirection};
 use tracing::trace;
 
@@ -74,7 +74,22 @@ impl DockerCompose {
 
         // It is critical that clean_up is run before everything else as the internal `docker compose` commands act as validation
         // for the docker-compose.yaml file that we later manually parse with poor error handling
-        DockerCompose::clean_up(yaml_path).unwrap();
+        let start = Instant::now();
+        loop {
+            DockerCompose::clean_up(yaml_path).unwrap();
+            println!("LOOP!");
+            match Self::check_no_containers_in_service(yaml_path, "") {
+                Ok(()) => break,
+                Err(error) => {
+                    std::thread::sleep(Duration::from_millis(100));
+                    if start.elapsed() > Duration::from_secs(10) {
+                        panic!(
+                            "Waited longer than 10 seconds for old docker image to delete. This image was not created by this DockerCompose instance. Error was:\n{error}"
+                        )
+                    }
+                }
+            }
+        }
 
         let service_to_image = DockerCompose::get_service_to_image(yaml_path);
 
@@ -185,12 +200,6 @@ impl DockerCompose {
             .max_by_key(|x| x.as_nanos())
             .unwrap();
 
-        // TODO: remove this check once CI docker compose is updated (probably ubuntu 22.04)
-        let can_use_status_flag =
-            run_command("docker", &["compose", "-f", file_path, "ps", "--help"])
-                .unwrap()
-                .contains("--status");
-
         let instant = time::Instant::now();
         loop {
             // check if every service is completely ready
@@ -214,17 +223,7 @@ impl DockerCompose {
 
             // check if the service has failed in some way
             // this allows us to report the failure to the developer a lot sooner than just relying on the timeout
-            if can_use_status_flag {
-                DockerCompose::assert_no_containers_in_service_with_status(
-                    file_path, "exited", &all_logs,
-                );
-                DockerCompose::assert_no_containers_in_service_with_status(
-                    file_path, "dead", &all_logs,
-                );
-                DockerCompose::assert_no_containers_in_service_with_status(
-                    file_path, "removing", &all_logs,
-                );
-            }
+            Self::check_no_containers_in_service(file_path, &all_logs).unwrap();
 
             // if all else fails timeout the wait
             if instant.elapsed() > timeout {
@@ -256,7 +255,17 @@ impl DockerCompose {
         }
     }
 
-    fn assert_no_containers_in_service_with_status(file_path: &str, status: &str, full_log: &str) {
+    fn check_no_containers_in_service(file_path: &str, full_log: &str) -> Result<(), String> {
+        DockerCompose::check_no_containers_in_service_with_status(file_path, "exited", &full_log)?;
+        DockerCompose::check_no_containers_in_service_with_status(file_path, "dead", &full_log)?;
+        DockerCompose::check_no_containers_in_service_with_status(file_path, "removing", &full_log)
+    }
+
+    fn check_no_containers_in_service_with_status(
+        file_path: &str,
+        status: &str,
+        full_log: &str,
+    ) -> Result<(), String> {
         let containers = run_command(
             "docker",
             &["compose", "-f", file_path, "ps", "--status", status],
@@ -264,9 +273,11 @@ impl DockerCompose {
         .unwrap();
         // One line for the table heading. If there are more lines then there is some data indicating that containers exist with this status
         if containers.matches('\n').count() > 1 {
-            panic!(
+            Err(format!(
                 "At least one container failed to initialize\n{containers}\nFull log\n{full_log}"
-            );
+            ))
+        } else {
+            Ok(())
         }
     }
 
